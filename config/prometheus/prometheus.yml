@@ -14,3 +14,8 @@ scrape_configs:
   - job_name: 'postgres'
     static_configs:
       - targets: ['db-store:5432']
+
+  - job_name: 'chronos_dashboard_exporter'
+    static_configs:
+      - targets: ['dashboard-exporter:9100']
+    metrics_path: '/metrics'

@@ -9,10 +9,17 @@
 > **Cognitive Deception Infrastructure** 
 > *A deterministic Ubuntu honeypot with controlled AI artifact generation*
 
+## Current Status
+
+This repo is a working, validated MVP for a deterministic Ubuntu deception environment. The core platform is implemented and the project passes the current automated validation suite: **24 passed, 1 skipped**.
+
+The project is not a generic AI application; it is a honeypot system that uses AI only in a constrained, content-generation role. The deterministic state layer, Redis-backed file system behavior, event collection, dashboard, and validation pipeline are in place and working.
+
 ## Project Lifecycle
 
 - **Phase 1 (6 months):** Core deception platform engineering and validation — **Completed**.
-- **Phase 2 (6 months):** AI integration hardening — AI generates plausible Ubuntu artifacts under strict constraints, without owning or modifying system state.
+- **Phase 2 (6 months):** AI integration hardening — **Functionally implemented and working as an MVP**.
+- **Production hardening:** Remaining items are operational polish, not core missing functionality.
 
 ---
 

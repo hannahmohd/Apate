@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # The Hot State: Single Source of Truth for Filesystem Metadata
   redis-store:
@@ -100,6 +98,30 @@ services:
       - OLLAMA_HOST=ollama
       - PYTHONPATH=/app/src
     command: ["python3", "-m", "chronos.core.world_main"]
+    volumes:
+      - .:/app
+    depends_on:
+      redis-store:
+        condition: service_healthy
+      db-store:
+        condition: service_healthy
+    networks:
+      - chronos-net
+
+  # Dashboard metrics exporter: exposes KPIs derived from Postgres + Redis
+  dashboard-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chronos_dashboard_exporter
+    environment:
+      - PYTHONPATH=/app/src
+      - CHRONOS_DASHBOARD_METRICS_PORT=9100
+      - CHRONOS_PG_HOST=db-store
+      - CHRONOS_REDIS_HOST=redis-store
+    command: ["python3", "-m", "chronos.core.dashboard_metrics_exporter"]
+    ports:
+      - "9100:9100"
     volumes:
       - .:/app
     depends_on:
