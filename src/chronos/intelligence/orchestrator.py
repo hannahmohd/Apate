@@ -100,15 +100,35 @@ class GenerationOrchestrator:
         self.deterministic_renderer = DeterministicRenderer()
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chronos-gen")
 
-        self._reserve_ai_slot = self.redis.register_script("""
-            local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-            if current < tonumber(ARGV[1]) then
-                redis.call('INCR', KEYS[1])
-                return 1
-            else
+        # Support both real redis clients (register_script exists) and test
+        # mocks that don't implement register_script.
+        if hasattr(self.redis, 'register_script'):
+            self._reserve_ai_slot = self.redis.register_script("""
+                local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+                if current < tonumber(ARGV[1]) then
+                    redis.call('INCR', KEYS[1])
+                    return 1
+                else
+                    return 0
+                end
+            """)
+        else:
+            def _reserve_ai_slot_py(keys=None, args=None):
+                # Simple Python fallback for test mocks
+                key = keys[0] if keys else None
+                limit = int(args[0]) if args else 0
+                current = int(self.redis.get(key) or 0)
+                if current < limit:
+                    try:
+                        self.redis.incr(key)
+                    except Exception:
+                        # If incr isn't available, emulate set
+                        val = int(self.redis.get(key) or 0) + 1
+                        self.redis.set(key, val)
+                    return 1
                 return 0
-            end
-        """)
+
+            self._reserve_ai_slot = _reserve_ai_slot_py
 
         # In-flight futures: inode → Future
         self._futures: Dict[int, Future] = {}
@@ -129,17 +149,18 @@ class GenerationOrchestrator:
         filename = os.path.basename(path)
 
         policy = self.policy_engine.resolve(filename, path, machine_state)
+        manifest_class = getattr(policy, 'manifest_class', None)
 
-        if policy.manifest_class == "static":
+        if manifest_class == "static":
             self._persist_empty(inode)
             return b""
             
-        if policy.manifest_class == "runtime":
+        if manifest_class == "runtime":
             # For attacker-created files without content, just return empty.
             # Do not persist empty, as they might be actively writing to it.
             return b""
             
-        if policy.manifest_class == "deterministic":
+        if manifest_class == "deterministic":
             content = self.deterministic_renderer.render(path, machine_state)
             self._persist(inode, content, policy, ProvenanceRecord(
                 model="deterministic",
@@ -151,9 +172,29 @@ class GenerationOrchestrator:
             ))
             return content
 
-        if policy.skip_generation:
+        if getattr(policy, 'skip_generation', False):
             self._persist_empty(inode)
             return b""
+
+        # If another worker has already generated or is generating, attach to it
+        meta = self.redis.hgetall(f"fs:inode:{inode}")
+        content_state = meta.get("content_state")
+        if content_state == "generated":
+            # Return the blob directly if available
+            blob_hash = meta.get("content_hash")
+            if blob_hash:
+                blob = self.redis.get(f"fs:blob:{blob_hash}")
+                return blob
+        if content_state == "generating":
+            # Attach to in-flight future if present
+            future = self._get_or_submit(inode, path, filename, session_id, machine_state, policy, PRIORITY_HIGH)
+            timeout = self._adaptive_timeout(policy.model)
+            try:
+                return future.result(timeout=timeout)
+            except FutureTimeoutError:
+                if _PROMETHEUS_AVAILABLE:
+                    _timeout_counter.labels(model=policy.model).inc()
+                return None
 
         # Attempt to reserve AI budget (limit 15)
         budget_key = "chronos:ai_budget:global"
@@ -184,7 +225,7 @@ class GenerationOrchestrator:
             self._persist(inode, fallback, policy, provenance, content_state="fallback")
             return fallback
 
-        self.redis.hset(f"fs:inode:{inode}", "content_state", "generating")
+        self.redis.hset(f"fs:inode:{inode}", mapping={"content_state": "generating"})
         future = self._get_or_submit(inode, path, filename, session_id, machine_state, policy, PRIORITY_HIGH)
 
         timeout = self._adaptive_timeout(policy.model)
@@ -208,14 +249,15 @@ class GenerationOrchestrator:
         filename = os.path.basename(path)
         policy = self.policy_engine.resolve(filename, path, machine_state)
 
-        if policy.manifest_class == "static":
+        manifest_class = getattr(policy, 'manifest_class', None)
+        if manifest_class == "static":
             self._persist_empty(inode)
             return
             
-        if policy.manifest_class == "runtime":
+        if manifest_class == "runtime":
             return
             
-        if policy.manifest_class == "deterministic":
+        if manifest_class == "deterministic":
             content = self.deterministic_renderer.render(path, machine_state)
             self._persist(inode, content, policy, ProvenanceRecord(
                 model="deterministic",
@@ -251,7 +293,7 @@ class GenerationOrchestrator:
             self._persist(inode, fallback, policy, provenance, content_state="fallback")
             return
 
-        self.redis.hset(f"fs:inode:{inode}", "content_state", "generating")
+        self.redis.hset(f"fs:inode:{inode}", mapping={"content_state": "generating"})
         self._get_or_submit(inode, path, filename, session_id, machine_state, policy, priority)
 
     # ------------------------------------------------------------------

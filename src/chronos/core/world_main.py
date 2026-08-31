@@ -3,6 +3,7 @@ import time
 import signal
 from chronos.simulation.orchestrator import world_simulation
 from chronos.core.persistence import PersistenceLayer
+from chronos.core.metrics import start_metrics_server
 
 def signal_handler(sig, frame):
     print("\n[!] Received shutdown signal, stopping world simulation...")
@@ -23,6 +24,10 @@ def main():
     # Register Signal Handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Start metrics endpoint for world engine
+    print("[*] Starting Metrics Server for World Engine...")
+    start_metrics_server()
 
     world_simulation.start(tick_interval=60)
     

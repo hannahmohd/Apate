@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Dict, Any
 
 import redis
+from prometheus_client import Counter, Histogram
 
 from chronos.watcher.log_streamer import AuditLogStreamer
 from chronos.core.persistence import PersistenceLayer
@@ -12,6 +13,16 @@ from chronos.skills.threat_library import ThreatLibrary
 from chronos.skills.skill_detector import SkillDetector
 
 logger = logging.getLogger(__name__)
+
+# Prometheus metrics
+SESSION_DURATION_HIST = Histogram(
+    'chronos_session_duration_seconds',
+    'Session duration in seconds measured at session end'
+)
+SESSION_COMMANDS_COUNTER = Counter(
+    'chronos_session_commands_total',
+    'Total number of commands executed across sessions'
+)
 
 class EvidenceCollector:
     """
@@ -122,7 +133,13 @@ class EvidenceCollector:
             if command_analyses:
                 skill_assessment = self.skill_detector.analyze_session(session_id, command_analyses)
                 evidence['skill_assessment'] = skill_assessment
-            
+            # Emit basic Prometheus metrics before flushing
+            try:
+                SESSION_DURATION_HIST.observe(evidence['duration_seconds'])
+                SESSION_COMMANDS_COUNTER.inc(len(evidence.get('commands', [])))
+            except Exception:
+                logger.exception("Failed to emit Prometheus metrics for session %s", session_id)
+
             self._save_evidence(session_id, evidence)
             self._flush(session_id, evidence)
             return

@@ -3,7 +3,7 @@ import os
 import signal
 import threading
 from fuse import FUSE
-from prometheus_client import start_http_server
+from chronos.core.metrics import start_metrics_server
 from chronos.core.state import StateHypervisor
 from chronos.interface.fuse import ChronosFUSE
 from chronos.core.persistence import PersistenceLayer
@@ -36,8 +36,8 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # 3. Start Metrics Server
-    print("[*] Starting Metrics Server on port 8000...")
-    start_http_server(8000)
+    print("[*] Starting Metrics Server...")
+    start_metrics_server()
 
     # 4. Start Watcher Pipeline (audit streamer + evidence collector)
     try:
