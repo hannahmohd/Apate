@@ -1,95 +1,31 @@
-"""
-orchestrator.py
----------------
-Non-blocking generation orchestration for ChronosFUSE.
-
-The FUSE read() hot path must never block indefinitely on an LLM call.
-This module handles:
-  - Background generation pool (ThreadPoolExecutor)
-  - Redis-backed dedup locks (fs:generating:<inode>, TTL 30s)
-  - Adaptive timeouts (P95 latency per model + 2.0s safety margin)
-  - Per-session inference quotas (token bucket via Redis)
-  - POSIX-realistic error responses on timeout (EAGAIN / ETIMEDOUT / EIO)
-  - Background completion: generation persists even after timeout
-
-Guardrails (hard rules, never violated):
-  1. AI never owns state truth — blob content only, never inode/directory state.
-  2. No AI call blocks a syscall indefinitely — every path has a hard timeout.
-  3. Timeout returns a realistic POSIX error, not an "AI unavailable" message.
-  4. Generation continues in background after timeout and is cached on completion.
-"""
+"""Bounded lazy generation with Redis leases and fenced content commits."""
 
 import errno
 import hashlib
-import json
-import random
-import time
+import logging
+import os
+import stat
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import Any, Callable, Dict, Optional
-
-from chronos.intelligence.artifact_policy import ArtifactPolicy, ArtifactPolicyEngine
-from chronos.intelligence.prompt_builder import PromptBuilder
-from chronos.intelligence.inference import InferenceRuntime, get_runtime
-from chronos.intelligence.ubuntu_profile import UbuntuProfile
-from chronos.intelligence.validator import SemanticValidator
-from chronos.intelligence.fallback import FallbackProvider
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import redis
+from chronos.core.content import read_blob
+from chronos.intelligence.artifact_policy import ArtifactPolicyEngine
 from chronos.intelligence.deterministic_renderer import DeterministicRenderer
-from chronos.intelligence.inference import ModelUnreachableError
+from chronos.intelligence.fallback import FallbackProvider
+from chronos.intelligence.inference import get_runtime
+from chronos.intelligence.prompt_builder import PromptBuilder
 from chronos.intelligence.provenance import ProvenanceRecord, GenerationSource
+from chronos.intelligence.validator import SemanticValidator
 
-# Generation priority levels (used for future prioritization)
-PRIORITY_HIGH = 1    # on create()
-PRIORITY_MEDIUM = 2  # on readdir() prewarm
-PRIORITY_LOW = 3     # background idle
-
-# Prometheus metrics — optional, fail silently if prometheus_client not present
-try:
-    from prometheus_client import Histogram, Counter
-    _generation_latency = Histogram(
-        "chronos_generation_latency_seconds",
-        "Time from generation start to completion",
-        ["model", "file_class"],
-    )
-    _timeout_counter = Counter(
-        "chronos_generation_timeouts_total",
-        "Count of generation timeouts returned to FUSE",
-        ["model"],
-    )
-    _quota_counter = Counter(
-        "chronos_inference_quota_exhausted_total",
-        "Count of generations skipped due to session quota",
-        ["session_id"],
-    )
-    _PROMETHEUS_AVAILABLE = True
-except ImportError:
-    _PROMETHEUS_AVAILABLE = False
-
-# Latency history stored in Redis: chronos:metrics:latency:<model> → JSON list of seconds
-_LATENCY_KEY = "chronos:metrics:latency:{model}"
-_LATENCY_WINDOW = 50      # rolling window size for P95 calculation
-_SAFETY_MARGIN = 2.0      # seconds added on top of P95
-_DEFAULT_TIMEOUT = 10.0   # used when no latency history is available
-_LOCK_TTL = 30            # seconds for the Redis generation dedup lock
-_PREWARM_LIMIT = 5        # max concurrent background prewarms per readdir()
-_QUOTA_WINDOW = 60        # seconds for the per-session quota window
+logger = logging.getLogger(__name__)
+PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW = 1, 2, 3
+LOCK_TTL = 120
 
 
 class GenerationOrchestrator:
-    """
-    Manages background file content generation for ChronosFUSE.
-
-    One instance is shared by the entire FUSE process.
-    Thread-safe: all shared state is protected by Redis or threading primitives.
-    """
-
-    def __init__(
-        self,
-        redis_client,
-        profile: UbuntuProfile,
-        runtime: Optional[InferenceRuntime] = None,
-        max_workers: int = 8,
-    ):
+    def __init__(self, redis_client, profile, runtime=None, max_workers=8):
         self.redis = redis_client
         self.profile = profile
         self.runtime = runtime or get_runtime()
@@ -98,416 +34,222 @@ class GenerationOrchestrator:
         self.validator = SemanticValidator()
         self.fallback_provider = FallbackProvider()
         self.deterministic_renderer = DeterministicRenderer()
-        self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chronos-gen")
-
-        # Support both real redis clients (register_script exists) and test
-        # mocks that don't implement register_script.
-        if hasattr(self.redis, 'register_script'):
-            self._reserve_ai_slot = self.redis.register_script("""
-                local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-                if current < tonumber(ARGV[1]) then
-                    redis.call('INCR', KEYS[1])
-                    return 1
-                else
-                    return 0
-                end
-            """)
-        else:
-            def _reserve_ai_slot_py(keys=None, args=None):
-                # Simple Python fallback for test mocks
-                key = keys[0] if keys else None
-                limit = int(args[0]) if args else 0
-                current = int(self.redis.get(key) or 0)
-                if current < limit:
-                    try:
-                        self.redis.incr(key)
-                    except Exception:
-                        # If incr isn't available, emulate set
-                        val = int(self.redis.get(key) or 0) + 1
-                        self.redis.set(key, val)
-                    return 1
-                return 0
-
-            self._reserve_ai_slot = _reserve_ai_slot_py
-
-        # In-flight futures: inode → Future
-        self._futures: Dict[int, Future] = {}
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="chronos-gen"
+        )
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._futures = {}
         self._futures_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # Public API — called from ChronosFUSE
-    # ------------------------------------------------------------------
+    def _cached(self, meta):
+        if meta.get("content_hash"):
+            return read_blob(self.redis, meta["content_hash"])
+        return None
 
-    def get_or_generate(
-        self,
-        inode: int,
-        path: str,
-        session_id: str,
-        machine_state: Dict[str, Any],
-    ) -> Optional[bytes]:
-        import os
-        filename = os.path.basename(path)
-
-        policy = self.policy_engine.resolve(filename, path, machine_state)
-        manifest_class = getattr(policy, 'manifest_class', None)
-
-        if manifest_class == "static":
-            self._persist_empty(inode)
-            return b""
-            
-        if manifest_class == "runtime":
-            # For attacker-created files without content, just return empty.
-            # Do not persist empty, as they might be actively writing to it.
-            return b""
-            
-        if manifest_class == "deterministic":
-            content = self.deterministic_renderer.render(path, machine_state)
-            self._persist(inode, content, policy, ProvenanceRecord(
-                model="deterministic",
-                generation_source=GenerationSource.TEMPLATE,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=True
-            ))
-            return content
-
-        if getattr(policy, 'skip_generation', False):
-            self._persist_empty(inode)
-            return b""
-
-        # If another worker has already generated or is generating, attach to it
+    def get_or_generate(self, inode, path, session_id, machine_state):
         meta = self.redis.hgetall(f"fs:inode:{inode}")
-        content_state = meta.get("content_state")
-        if content_state == "generated":
-            # Return the blob directly if available
-            blob_hash = meta.get("content_hash")
-            if blob_hash:
-                blob = self.redis.get(f"fs:blob:{blob_hash}")
-                return blob
-        if content_state == "generating":
-            # Attach to in-flight future if present
-            future = self._get_or_submit(inode, path, filename, session_id, machine_state, policy, PRIORITY_HIGH)
-            timeout = self._adaptive_timeout(policy.model)
-            try:
-                return future.result(timeout=timeout)
-            except FutureTimeoutError:
-                if _PROMETHEUS_AVAILABLE:
-                    _timeout_counter.labels(model=policy.model).inc()
-                return None
-
-        # Attempt to reserve AI budget (limit 15)
-        budget_key = "chronos:ai_budget:global"
-        if not self._reserve_ai_slot(keys=[budget_key], args=[15]):
-            fallback = self.fallback_provider.get_degraded_content(filename, policy)
-            provenance = ProvenanceRecord(
-                model=policy.model,
-                generation_source=GenerationSource.FALLBACK,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=False
-            )
-            self._persist(inode, fallback, policy, provenance, content_state="fallback")
-            return fallback
-
-        # Check per-session inference quota
-        if not self._check_and_decrement_quota(session_id, policy):
-            fallback = self.fallback_provider.get_degraded_content(filename, policy)
-            provenance = ProvenanceRecord(
-                model=policy.model,
-                generation_source=GenerationSource.FALLBACK,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=False
-            )
-            self._persist(inode, fallback, policy, provenance, content_state="fallback")
-            return fallback
-
-        self.redis.hset(f"fs:inode:{inode}", mapping={"content_state": "generating"})
-        future = self._get_or_submit(inode, path, filename, session_id, machine_state, policy, PRIORITY_HIGH)
-
-        timeout = self._adaptive_timeout(policy.model)
+        if not meta:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        if not stat.S_ISREG(int(meta["mode"])):
+            raise IsADirectoryError(errno.EISDIR, "Is a directory")
+        cached = self._cached(meta)
+        if cached is not None:
+            return cached
+        # Recreating a manifest path does not make an attacker file AI-backed.
+        if meta.get("manifest_class", "runtime") not in ("ai_backed", "deterministic"):
+            return b""
+        future = self._submit(inode, path, session_id)
+        if future is None:
+            return None
         try:
-            result = future.result(timeout=timeout)
-            return result
-        except FutureTimeoutError:
-            if _PROMETHEUS_AVAILABLE:
-                _timeout_counter.labels(model=policy.model).inc()
+            return future.result(timeout=10)
+        except TimeoutError:
             return None
 
     def submit_background(
-        self,
-        inode: int,
-        path: str,
-        session_id: str,
-        machine_state: Dict[str, Any],
-        priority: int = PRIORITY_MEDIUM,
-    ) -> None:
-        import os
-        filename = os.path.basename(path)
-        policy = self.policy_engine.resolve(filename, path, machine_state)
-
-        manifest_class = getattr(policy, 'manifest_class', None)
-        if manifest_class == "static":
-            self._persist_empty(inode)
-            return
-            
-        if manifest_class == "runtime":
-            return
-            
-        if manifest_class == "deterministic":
-            content = self.deterministic_renderer.render(path, machine_state)
-            self._persist(inode, content, policy, ProvenanceRecord(
-                model="deterministic",
-                generation_source=GenerationSource.TEMPLATE,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=True
-            ))
-            return
-
-        if policy.skip_generation:
-            self._persist_empty(inode)
-            return
-            
-        # Check if already generated or fallback
+        self, inode, path, session_id, machine_state, priority=PRIORITY_MEDIUM
+    ):
         meta = self.redis.hgetall(f"fs:inode:{inode}")
-        content_state = meta.get("content_state")
-        if content_state in ["generated", "fallback", "generating"]:
-            return
+        if (
+            meta
+            and not meta.get("content_hash")
+            and stat.S_ISREG(int(meta["mode"]))
+            and meta.get("manifest_class") in ("ai_backed", "deterministic")
+        ):
+            self._submit(inode, path, session_id)
 
-        budget_key = "chronos:ai_budget:global"
-        if not self._reserve_ai_slot(keys=[budget_key], args=[15]):
-            fallback = self.fallback_provider.get_degraded_content(filename, policy)
-            provenance = ProvenanceRecord(
-                model=policy.model,
-                generation_source=GenerationSource.FALLBACK,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=False
-            )
-            self._persist(inode, fallback, policy, provenance, content_state="fallback")
-            return
-
-        self.redis.hset(f"fs:inode:{inode}", mapping={"content_state": "generating"})
-        self._get_or_submit(inode, path, filename, session_id, machine_state, policy, priority)
-
-    # ------------------------------------------------------------------
-    # Internal generation machinery
-    # ------------------------------------------------------------------
-
-    def _get_or_submit(
-        self,
-        inode: int,
-        path: str,
-        filename: str,
-        session_id: str,
-        machine_state: Dict[str, Any],
-        policy: ArtifactPolicy,
-        priority: int,
-    ) -> Future:
+    def _submit(self, inode, path, session_id):
         with self._futures_lock:
-            if inode in self._futures and not self._futures[inode].done():
+            if inode in self._futures:
                 return self._futures[inode]
-
-            # Acquire Redis dedup lock so other FUSE worker threads don't duplicate
-            lock_key = f"fs:generating:{inode}"
-            if not self.redis.set(lock_key, session_id, nx=True, ex=_LOCK_TTL):
-                # Another thread holds the lock — attach to its future if we have one
-                if inode in self._futures:
-                    return self._futures[inode]
-
-            future = self._pool.submit(
-                self._generate_and_persist,
-                inode, path, filename, session_id, machine_state, policy,
-            )
-            self._futures[inode] = future
-            return future
-
-    def _generate_and_persist(
-        self,
-        inode: int,
-        path: str,
-        filename: str,
-        session_id: str,
-        machine_state: Dict[str, Any],
-        policy: ArtifactPolicy,
-    ) -> bytes:
-        """
-        Runs in a background thread.
-        Generates content, validates it, and persists it to Redis.
-        Returns the final bytes regardless of who (if anyone) is still waiting.
-        """
-        start = time.monotonic()
-        lock_key = f"fs:generating:{inode}"
-
-        try:
-            system_prompt = self.prompt_builder.build_system_prompt(machine_state)
-            prompt = self.prompt_builder.build(filename, path, machine_state, policy)
-
-            retry_count = 0
-            content_bytes = b""
-            
-            provenance = ProvenanceRecord(
-                model=policy.model,
-                generation_source=GenerationSource.LLM,
-                file_class=policy.file_class,
-                prompt_version="1.0",
-                generated_at=str(time.time()),
-                validated=True
-            )
-            
+            if not self._slots.acquire(blocking=False):
+                return None
             try:
-                while retry_count < 2:
-                    raw = self.runtime.generate(
-                        prompt=prompt,
-                        system_prompt=system_prompt,
-                        model=policy.model,
-                        max_tokens=policy.max_lines * 10 if policy.max_lines else 1000,
-                    )
-                    result = self.validator.validate(raw, policy, machine_state)
-                    if result.accepted:
-                        content_bytes = raw.encode("utf-8")
+                future = self._pool.submit(self._resolve, inode, path, session_id)
+                self._futures[inode] = future
+            except BaseException:
+                self._slots.release()
+                raise
+
+        # add_done_callback can run immediately: never register while holding this lock.
+        def finished(completed):
+            with self._futures_lock:
+                if self._futures.get(inode) is completed:
+                    del self._futures[inode]
+            self._slots.release()
+
+        future.add_done_callback(finished)
+        return future
+
+    def _resolve(self, inode, path, session_id):
+        key, lease = f"fs:inode:{inode}", f"fs:generating:{inode}"
+        token = str(uuid.uuid4())
+        deadline = time.monotonic() + 10
+        # Other owners only wait/read. They never invoke the model without a claim.
+        while not self.redis.set(lease, token, nx=True, ex=LOCK_TTL):
+            meta = self.redis.hgetall(key)
+            if not meta:
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+            cached = self._cached(meta)
+            if cached is not None:
+                return cached
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+        try:
+            meta = self.redis.hgetall(key)
+            if not meta:
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+            cached = self._cached(meta)
+            if cached is not None:
+                return cached
+            if meta.get("manifest_class") not in ("ai_backed", "deterministic"):
+                return b""
+            # Only trusted profile facts enter prompts, never attacker history/env.
+            machine = self.profile.build_machine_state()
+            policy = self.policy_engine.resolve(os.path.basename(path), path, machine)
+            source, validated = GenerationSource.TEMPLATE, True
+            if meta["manifest_class"] == "deterministic":
+                content = self.deterministic_renderer.render(path, machine)
+            elif policy.skip_generation:
+                content = b""
+            elif not self._quota(session_id):
+                content = self.fallback_provider.get_degraded_content(
+                    os.path.basename(path), policy, path=path, machine_state=machine
+                )
+                source, validated = GenerationSource.FALLBACK, False
+            else:
+                content = None
+                job_deadline = time.monotonic() + 60.0
+                for attempt in range(2):
+                    time_left = job_deadline - time.monotonic()
+                    if time_left <= 0:
                         break
-                    retry_count += 1
-            except ModelUnreachableError:
-                # Infrastructure failure: immediately fall back without validating
-                content_bytes = self.fallback_provider.get_degraded_content(filename, policy)
-                provenance.generation_source = GenerationSource.FALLBACK
-                provenance.validated = False
-
-            if not content_bytes:
-                content_bytes = self.fallback_provider.get_degraded_content(filename, policy)
-                provenance.generation_source = GenerationSource.TEMPLATE
-                provenance.validated = False
-
-            self._persist(inode, content_bytes, policy, provenance, content_state="generated")
-
-            elapsed = time.monotonic() - start
-            self._record_latency(policy.model, elapsed)
-            if _PROMETHEUS_AVAILABLE:
-                _generation_latency.labels(model=policy.model, file_class=policy.file_class).observe(elapsed)
-
-            return content_bytes
-
-        except Exception as e:
-            print(f"[Orchestrator] Generation error for inode {inode} path={path}: {e}")
-            fallback = self.fallback_provider.get_degraded_content(filename, policy)
+                    if attempt and not self._quota(session_id):
+                        break  # Retries consume the same model-call budget.
+                    try:
+                        raw = self.runtime.generate(
+                            prompt=self.prompt_builder.build(
+                                os.path.basename(path), path, machine, policy
+                            ),
+                            system_prompt=self.prompt_builder.build_system_prompt(
+                                machine
+                            ),
+                            model=policy.model,
+                            max_tokens=min(2000, max(1, policy.max_lines or 80) * 10),
+                            timeout=time_left
+                        )
+                        result = self.validator.validate(raw, policy, {**machine, 'artifact_path': path})
+                        if result.accepted:
+                            content = raw.encode("utf-8")
+                            source = GenerationSource.LLM
+                            break
+                        logger.warning(
+                            "Rejected generation inode=%s reason=%s",
+                            inode,
+                            result.reason,
+                        )
+                    except Exception:
+                        logger.exception("Model failure inode=%s", inode)
+                if content is None:
+                    content = self.fallback_provider.get_degraded_content(
+                        os.path.basename(path), policy, path=path, machine_state=machine
+                    )
+                    source, validated = GenerationSource.FALLBACK, False
             provenance = ProvenanceRecord(
                 model=policy.model,
-                generation_source=GenerationSource.FALLBACK,
+                generation_source=source,
                 file_class=policy.file_class,
                 prompt_version="1.0",
                 generated_at=str(time.time()),
-                validated=False
+                validated=validated,
             )
-            self._persist(inode, fallback, policy, provenance, content_state="fallback")
-            return fallback
+            return self._commit(
+                inode, token, meta.get("revision", "0"), content, provenance
+            )
         finally:
-            self.redis.delete(lock_key)
-            with self._futures_lock:
-                self._futures.pop(inode, None)
+            self.redis.eval(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+                1,
+                lease,
+                token,
+            )
 
-    def _persist(
-        self,
-        inode: int,
-        content: bytes,
-        policy: ArtifactPolicy,
-        provenance: ProvenanceRecord,
-        content_state: str = "generated"
-    ) -> None:
-        """Persist content blob, inode content_hash, and provenance metadata."""
-        blob_hash = hashlib.sha256(content).hexdigest()
+    def _quota(self, session_id):
+        window = int(time.time() // 60)
+        limit = self.policy_engine.quota_config().get("max_generations_per_minute", 20)
+        return bool(
+            self.redis.eval(
+                """
+            local a = tonumber(redis.call('GET', KEYS[1]) or '0')
+            local b = tonumber(redis.call('GET', KEYS[2]) or '0')
+            if a >= tonumber(ARGV[1]) or b >= 60 then return 0 end
+            redis.call('INCR', KEYS[1]); redis.call('EXPIRE', KEYS[1], 120)
+            redis.call('INCR', KEYS[2]); redis.call('EXPIRE', KEYS[2], 120)
+            return 1
+        """,
+                2,
+                f"chronos:quota:{session_id}:{window}",
+                f"chronos:quota:global:{window}",
+                limit,
+            )
+        )
 
-        # Content blob
-        self.redis.set(f"fs:blob:{blob_hash}", content)
+    def _commit(self, inode, token, revision, content, provenance):
+        key, lease = f"fs:inode:{inode}", f"fs:generating:{inode}"
+        digest = hashlib.sha256(content).hexdigest()
+        with self.redis.pipeline() as pipe:
+            try:
+                pipe.watch(key, lease)
+                meta = pipe.hgetall(key)
+                if not meta:
+                    raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+                if (
+                    pipe.get(lease) != token
+                    or meta.get("revision", "0") != revision
+                    or meta.get("content_hash")
+                ):
+                    return self._cached(meta)
+                pipe.multi()
+                pipe.set(f"fs:blob:{digest}", content)
+                pipe.hset(
+                    key,
+                    mapping={
+                        "content_hash": digest,
+                        "size": len(content),
+                        "content_state": "generated",
+                    },
+                )
+                pipe.hset(f"fs:blob_meta:{digest}", mapping=provenance.to_dict())
+                pipe.execute()
+                return content
+            except redis.WatchError:
+                logger.info("Generation superseded inode=%s", inode)
+                return None
 
-        # Inode metadata
-        self.redis.hset(f"fs:inode:{inode}", mapping={
-            "content_hash": blob_hash,
-            "size": len(content),
-            "mtime": time.time(),
-            "artifact_category": policy.category,
-            "artifact_class": policy.file_class,
-            "content_state": content_state,
-        })
-
-        # Provenance (M2.H)
-        self.redis.hset(f"fs:blob_meta:{blob_hash}", mapping=provenance.to_dict())
-
-    def _persist_empty(self, inode: int) -> None:
-        """Persist an empty blob for files whose artifact policy is 'empty'."""
-        blob_hash = hashlib.sha256(b"").hexdigest()
-        self.redis.set(f"fs:blob:{blob_hash}", b"")
-        self.redis.hset(f"fs:inode:{inode}", mapping={
-            "content_hash": blob_hash,
-            "size": 0,
-            "mtime": time.time(),
-            "artifact_category": "empty",
-            "content_state": "static",
-        })
-
-    # ------------------------------------------------------------------
-    # Adaptive timeout
-    # ------------------------------------------------------------------
-
-    def _adaptive_timeout(self, model: str) -> float:
-        """
-        Compute timeout = P95(recent latency for model) + SAFETY_MARGIN.
-        Falls back to DEFAULT_TIMEOUT when insufficient history.
-        """
-        key = _LATENCY_KEY.format(model=model)
-        raw = self.redis.get(key)
-        if not raw:
-            return _DEFAULT_TIMEOUT
-        try:
-            samples = json.loads(raw)
-            if len(samples) < 5:
-                return _DEFAULT_TIMEOUT
-            samples_sorted = sorted(samples)
-            p95_index = int(len(samples_sorted) * 0.95)
-            return samples_sorted[p95_index] + _SAFETY_MARGIN
-        except (json.JSONDecodeError, IndexError):
-            return _DEFAULT_TIMEOUT
-
-    def _record_latency(self, model: str, elapsed: float) -> None:
-        """Push a latency sample into the rolling window for the given model."""
-        key = _LATENCY_KEY.format(model=model)
-        raw = self.redis.get(key)
-        samples = json.loads(raw) if raw else []
-        samples.append(elapsed)
-        if len(samples) > _LATENCY_WINDOW:
-            samples = samples[-_LATENCY_WINDOW:]
-        self.redis.set(key, json.dumps(samples))
-
-    # ------------------------------------------------------------------
-    # Inference quota (per session, token bucket via Redis)
-    # ------------------------------------------------------------------
-
-    def _check_and_decrement_quota(self, session_id: str, policy: ArtifactPolicy) -> bool:
-        """
-        Returns True if the session is within quota, False if exhausted.
-        Uses a simple sliding window counter in Redis.
-        """
-        quota_cfg = self.policy_engine.quota_config()
-        max_per_minute = quota_cfg.get("max_generations_per_minute", 20)
-
-        bucket_key = f"chronos:quota:{session_id}:{int(time.time() // _QUOTA_WINDOW)}"
-        count = self.redis.incr(bucket_key)
-        if count == 1:
-            self.redis.expire(bucket_key, _QUOTA_WINDOW * 2)
-
-        if count > max_per_minute:
-            if _PROMETHEUS_AVAILABLE:
-                _quota_counter.labels(session_id=session_id).inc()
-            return False
-        return True
+    def close(self):
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
-def posix_timeout_error() -> int:
-    """Return a randomized realistic POSIX errno for a timeout response."""
-    return random.choice([errno.EAGAIN, errno.ETIMEDOUT, errno.EIO])
+def posix_timeout_error():
+    return errno.EAGAIN

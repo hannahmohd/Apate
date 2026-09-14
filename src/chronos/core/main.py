@@ -44,7 +44,10 @@ def main():
         from chronos.watcher.log_streamer import AuditLogStreamer
         from chronos.watcher.evidence_collector import EvidenceCollector
 
-        streamer = AuditLogStreamer(db_layer)
+        streamer = AuditLogStreamer({
+            "host": db_layer.host, "user": db_layer.user,
+            "password": db_layer.password, "dbname": db_layer.dbname,
+        })
         evidence_collector = EvidenceCollector(streamer, db_layer)
 
         streamer_thread = threading.Thread(target=streamer.start, daemon=True)
@@ -69,7 +72,9 @@ def main():
     try:
         # allow_other is crucial for Docker if accessed from host or other users
         # foreground=True simplifies debugging and signal handling
-        FUSE(ChronosFUSE(mount_point, db_layer=db_layer), mount_point, foreground=True, allow_other=True)
+        FUSE(ChronosFUSE(mount_point, db_layer=db_layer), mount_point,
+             foreground=True, allow_other=True, direct_io=True, default_permissions=True,
+             attr_timeout=0, entry_timeout=0, negative_timeout=0)
     except Exception as e:
         print(f"[!] FUSE Error: {e}")
         sys.exit(1)

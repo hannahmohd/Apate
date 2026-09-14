@@ -1,6 +1,8 @@
 import logging
 import json
 import threading
+import uuid
+import os
 from enum import IntEnum
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Any, Optional
@@ -93,8 +95,7 @@ class EventBus:
         self._pubsub_thread = None
         self._running = True
         
-        if self.redis:
-            self._start_redis_listener()
+        self._origin = str(uuid.uuid4())
             
     def _start_redis_listener(self):
         def listener():
@@ -107,6 +108,8 @@ class EventBus:
                 if message["type"] == "message":
                     try:
                         payload = json.loads(message["data"])
+                        if payload.get('origin') == self._origin:
+                            continue
                         event_type_name = payload.get("type")
                         event_data = payload.get("data", {})
                         
@@ -137,9 +140,10 @@ class EventBus:
         event_type = type(event)
         
         # Publish to Redis if connected and not a local-only bounce
-        if self.redis and not local_only:
+        if self.redis and not local_only and os.environ.get('CHRONOS_EXPERIMENTAL_WORLD') == '1':
             try:
                 payload = {
+                    "origin": self._origin,
                     "type": event_type.__name__,
                     "data": asdict(event)
                 }

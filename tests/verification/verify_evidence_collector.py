@@ -28,8 +28,9 @@ class MockPersistence:
         
     def flush_evidence(self, session_id, data):
         self.evidence_data[session_id] = data
+        return True
 
-def test_evidence_collector():
+def test_evidence_collector(isolated_redis):
     print("============================================================")
     print("Phase M2.F — Evidence Collector Verification")
     print("============================================================")
@@ -38,6 +39,8 @@ def test_evidence_collector():
     persistence = MockPersistence()
     
     collector = EvidenceCollector(streamer, persistence)
+    collector.redis.close()
+    collector.redis = isolated_redis
     
     # Clean up any previous test data in redis
     collector.redis.delete("chronos:evidence:test_session_abc123")
@@ -105,4 +108,5 @@ def test_evidence_collector():
     print("\n[SUCCESS] Evidence Collector Verified")
     
 if __name__ == "__main__":
-    test_evidence_collector()
+    import pytest
+    raise SystemExit(pytest.main([__file__, "-q"]))

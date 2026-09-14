@@ -88,9 +88,9 @@ artifact_policy:
 # Model routing — file type to local model.
 # Attacker skill level does NOT influence this. Reproducibility > fidelity tuning.
 model_routing:
-  history_file:  "llama3:3b"
-  notes_file:    "llama3:3b"
-  temp_file:     "llama3:3b"
+  history_file:  "llama3.2:3b"
+  notes_file:    "llama3.2:3b"
+  temp_file:     "llama3.2:3b"
   config_file:   "llama3:8b"
   script_file:   "llama3:8b"
   log_file:      "llama3:8b"

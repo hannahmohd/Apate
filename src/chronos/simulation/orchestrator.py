@@ -47,6 +47,7 @@ class SimulationOrchestrator:
     def start(self, tick_interval: int = 60):
         if not self._running:
             self.register_plugins()
+            self.event_bus._start_redis_listener()
             self._running = True
             self._tick_thread = threading.Thread(
                 target=self._tick_loop, 

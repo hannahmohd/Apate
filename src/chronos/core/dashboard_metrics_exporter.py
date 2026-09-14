@@ -23,13 +23,17 @@ def get_pg_conn():
     user = os.environ.get('CHRONOS_PG_USER', 'chronos')
     password = os.environ.get('CHRONOS_PG_PASSWORD', 'chronos_dev_password')
     dbname = os.environ.get('CHRONOS_PG_DB', 'chronos')
-    return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+    conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname,
+                            connect_timeout=5, options='-c statement_timeout=5000')
+    conn.autocommit = True
+    return conn
 
 
 def get_redis_conn():
     host = os.environ.get('CHRONOS_REDIS_HOST', '127.0.0.1')
     port = int(os.environ.get('CHRONOS_REDIS_PORT', '6379'))
-    return redis.Redis(host=host, port=port, db=0, decode_responses=True)
+    return redis.Redis(host=host, port=port, db=0, decode_responses=True,
+                       socket_timeout=3, socket_connect_timeout=3)
 
 
 def collect_and_set(pg_conn, rd):
@@ -51,10 +55,12 @@ def collect_and_set(pg_conn, rd):
             AVG_SESSION_DURATION.set(float(avg))
     except Exception as e:
         logger.exception("Postgres metrics collection failed: %s", e)
+        pg_conn.close()
+        return False
 
     try:
         # Provenance counts from Redis keys fs:blob_meta:*
-        keys = rd.keys('fs:blob_meta:*')
+        keys = rd.scan_iter('session:*:fs:blob_meta:*', count=100)
         llm = 0
         fallback = 0
         template = 0
@@ -73,6 +79,8 @@ def collect_and_set(pg_conn, rd):
         PROVENANCE_TEMPLATE.set(template)
     except Exception as e:
         logger.exception("Redis provenance collection failed: %s", e)
+        return False
+    return True
 
 
 def main():
@@ -101,7 +109,10 @@ def main():
                 time.sleep(5)
                 continue
 
-        collect_and_set(pg, rd)
+        if not collect_and_set(pg, rd):
+            pg.close()
+            rd.close()
+            pg = rd = None
         time.sleep(10)
 
 

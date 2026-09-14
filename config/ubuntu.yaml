@@ -42,6 +42,7 @@ users:
   - { name: root,   uid: 0,    gid: 0,    shell: /bin/bash, home: /root }
 
 groups:
+  - { name: root,     gid: 0,    members: [root] }
   - { name: ubuntu,   gid: 1000, members: [ubuntu] }
   - { name: www-data, gid: 33,   members: [www-data, ubuntu] }
   - { name: sudo,     gid: 27,   members: [ubuntu] }
@@ -82,6 +83,9 @@ filesystem:
     - { path: "/etc/nginx/sites-enabled", type: directory, class: static }
     - { path: "/etc/ssh", type: directory, class: static }
     - { path: "/etc/fail2ban", type: directory, class: static }
+    - { path: "/etc/ssl", type: directory, class: static }
+    - { path: "/etc/ssl/certs", type: directory, class: static }
+    - { path: "/etc/ssl/private", type: directory, class: static, mode: "0700", uid: 0, gid: 0 }
     - { path: "/home", type: directory, class: static }
     - { path: "/home/ubuntu", type: directory, class: static }
     - { path: "/home/ubuntu/.ssh", type: directory, class: static }
@@ -110,6 +114,8 @@ filesystem:
     - { path: "/etc/fstab", type: file, class: deterministic }
     - { path: "/etc/resolv.conf", type: file, class: deterministic }
     - { path: "/etc/ssh/sshd_config", type: file, class: deterministic }
+    - { path: "/etc/ssl/certs/ssl-cert-snakeoil.pem", type: file, class: deterministic }
+    - { path: "/etc/ssl/private/ssl-cert-snakeoil.key", type: file, class: deterministic, mode: "0600", uid: 0, gid: 0 }
 
     # AI-Backed Contextual files (Lazy generated, constrained by budget)
     - { path: "/var/log/auth.log", type: file, class: ai_backed }
@@ -118,4 +124,3 @@ filesystem:
     - { path: "/home/ubuntu/notes.txt", type: file, class: ai_backed }
     - { path: "/etc/nginx/nginx.conf", type: file, class: ai_backed }
     - { path: "/var/www/html/index.html", type: file, class: ai_backed }
-

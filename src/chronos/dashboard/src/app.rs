@@ -37,6 +37,7 @@ pub struct ChronosDashboard {
     // View 1: Live Ops
     audit_logs: Vec<AuditEvent>,
     stream_paused: bool,
+    paused_logs: Vec<AuditEvent>,
     filter_operation: String,
 
     // View 2: Sessions
@@ -46,6 +47,9 @@ pub struct ChronosDashboard {
     selected_session: Option<SessionDetail>,
     selected_session_id: Option<String>,
     detail_loading: bool,
+    export_destination: String,
+    export_busy: bool,
+    export_status: String,
 
     // View 4: Provenance
     provenance_snapshot: Option<ProvenanceSummary>,
@@ -72,11 +76,15 @@ impl ChronosDashboard {
             active_session_count: 0,
             audit_logs: Vec::new(),
             stream_paused: false,
+            paused_logs: Vec::new(),
             filter_operation: "All".to_string(),
             sessions: Vec::new(),
             selected_session: None,
             selected_session_id: None,
             detail_loading: false,
+            export_destination: String::new(),
+            export_busy: false,
+            export_status: String::new(),
             provenance_snapshot: None,
         }
     }
@@ -89,10 +97,13 @@ impl ChronosDashboard {
                 BackendMessage::TotalFiles(c) => self.total_files = c,
                 BackendMessage::ActiveSessionCount(c) => self.active_session_count = c,
                 BackendMessage::AuditLogs(mut events) => {
-                    if !self.stream_paused {
-                        for event in events.drain(..).rev() {
-                            self.audit_logs.insert(0, event);
+                    {
+                        for event in events.drain(..) {
+                            if !self.audit_logs.iter().any(|existing| existing.id == event.id) {
+                                self.audit_logs.push(event);
+                            }
                         }
+                        self.audit_logs.sort_by_key(|event| std::cmp::Reverse(event.id));
                         if self.audit_logs.len() > 1000 {
                             self.audit_logs.truncate(1000);
                         }
@@ -100,6 +111,13 @@ impl ChronosDashboard {
                 }
                 BackendMessage::SessionList(sessions) => {
                     self.sessions = sessions;
+                }
+                BackendMessage::ExportResult(result) => {
+                    self.export_busy = false;
+                    self.export_status = match result {
+                        Ok(path) => format!("Export complete: {}. Raw evidence may contain secrets.", path),
+                        Err(message) => message,
+                    };
                 }
                 BackendMessage::SessionDetailResult(detail) => {
                     self.selected_session = *detail;
@@ -180,6 +198,11 @@ impl ChronosDashboard {
             let pause_label = if self.stream_paused { "▶ Resume" } else { "⏸ Pause" };
             if ui.button(egui::RichText::new(pause_label).size(12.0)).clicked() {
                 self.stream_paused = !self.stream_paused;
+                if self.stream_paused {
+                    self.paused_logs = self.audit_logs.clone();
+                } else {
+                    self.paused_logs.clear();
+                }
             }
 
             ui.separator();
@@ -198,9 +221,11 @@ impl ChronosDashboard {
 
         ui.separator();
 
-        let filtered_logs: Vec<&AuditEvent> = self.audit_logs.iter().filter(|e| {
+        ui.label("Live preview: newest 1,000 events, not a complete research export. Pause freezes the view only.");
+        let visible_logs = if self.stream_paused { &self.paused_logs } else { &self.audit_logs };
+        let filtered_logs: Vec<&AuditEvent> = visible_logs.iter().filter(|e| {
             if self.filter_operation == "All" { return true; }
-            e.operation.as_deref() == Some(self.filter_operation.as_str())
+            e.operation.as_deref().is_some_and(|op| op.eq_ignore_ascii_case(&self.filter_operation))
         }).collect();
 
         let available_height = ui.available_height();
@@ -294,7 +319,7 @@ impl ChronosDashboard {
                 header.col(|ui| { ui.strong("Session"); });
                 header.col(|ui| { ui.strong("Duration"); });
                 header.col(|ui| { ui.strong("Status"); });
-                header.col(|ui| { ui.strong("Confidence"); });
+                header.col(|ui| { ui.strong("Calibration"); });
                 header.col(|ui| { ui.strong("Exit"); });
                 header.col(|ui| { ui.strong("First Suspicious Cmd"); });
             })
@@ -324,10 +349,7 @@ impl ChronosDashboard {
                         ui.label(egui::RichText::new(status.to_uppercase()).color(color).size(11.0));
                     });
                     row.col(|ui| {
-                        let conf = session.detection_confidence.unwrap_or(0.0);
-                        let bar = egui::ProgressBar::new(conf as f32)
-                            .text(format!("{:.0}%", conf * 100.0));
-                        ui.add(bar);
+                        ui.label("Not calibrated");
                     });
                     row.col(|ui| {
                         ui.label(egui::RichText::new(
@@ -382,6 +404,21 @@ impl ChronosDashboard {
             }
         };
 
+        ui.horizontal(|ui| {
+            ui.label("New export folder:");
+            ui.text_edit_singleline(&mut self.export_destination);
+            if ui.add_enabled(!self.export_busy && !self.export_destination.trim().is_empty(),
+                              egui::Button::new("Export evidence")).clicked() {
+                self.export_busy = self.tx_req.send(BackendRequest::ExportSession {
+                    session_id: detail.session_id.clone(),
+                    destination: self.export_destination.clone(),
+                }).is_ok();
+                self.export_status = if self.export_busy { "Exporting database snapshot…".into() }
+                                     else { "Export backend is unavailable.".into() };
+            }
+        });
+        ui.label(&self.export_status);
+
         // Header card
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -400,9 +437,7 @@ impl ChronosDashboard {
                 };
                 ui.label(egui::RichText::new(status.to_uppercase()).color(color).strong());
                 ui.separator();
-                ui.label(egui::RichText::new("Confidence:").strong());
-                let conf = detail.detection_confidence.unwrap_or(0.0);
-                ui.add(egui::ProgressBar::new(conf as f32).text(format!("{:.0}%", conf * 100.0)).desired_width(80.0));
+                ui.label("Rule-based flag; not a probability or evidence of honeypot discovery.");
             });
         });
 
@@ -454,6 +489,18 @@ impl ChronosDashboard {
                             });
 
                             // Techniques
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Outcome: {}", cmd.outcome.as_deref().unwrap_or("unknown (legacy record)")));
+                                if let Some(status) = cmd.exit_status {
+                                    ui.label(format!("exit {}", status));
+                                }
+                                if let Some(seconds) = cmd.server_elapsed_seconds {
+                                    ui.label(format!("server {:.3}s", seconds));
+                                }
+                                if let Some(bytes) = cmd.response_bytes {
+                                    ui.label(format!("{} response bytes", bytes));
+                                }
+                            });
                             if let Some(techniques) = &cmd.techniques {
                                 if !techniques.is_empty() {
                                     ui.horizontal(|ui| {

@@ -43,11 +43,38 @@ pub struct AuditEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandEntry {
+    pub command_id: Option<String>,
+    pub outcome: Option<String>,
+    pub exit_status: Option<i32>,
+    pub server_elapsed_seconds: Option<f64>,
+    pub response_bytes: Option<u64>,
     pub timestamp: Option<String>,
     pub command: Option<String>,
     pub techniques: Option<Vec<String>>,
     pub risk_score: Option<i64>,
     pub signatures: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod research_tests {
+    use super::CommandEntry;
+
+    #[test]
+    fn legacy_command_is_not_assumed_successful() {
+        let command: CommandEntry = serde_json::from_str(r#"{"command":"id"}"#).unwrap();
+        assert!(command.outcome.is_none());
+        assert!(command.server_elapsed_seconds.is_none());
+    }
+
+    #[test]
+    fn measured_outcome_survives_deserialization() {
+        let command: CommandEntry = serde_json::from_str(
+            r#"{"command":"id","command_id":"a","outcome":"emulated_success","exit_status":0,"server_elapsed_seconds":0.125,"response_bytes":42}"#
+        ).unwrap();
+        assert_eq!(command.outcome.as_deref(), Some("emulated_success"));
+        assert_eq!(command.server_elapsed_seconds, Some(0.125));
+        assert_eq!(command.response_bytes, Some(42));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +111,7 @@ pub struct SessionDetail {
 
 #[derive(Debug, Clone)]
 pub enum BackendMessage {
+    ExportResult(Result<String, String>),
     RedisConnected(bool),
     PostgresConnected(bool),
     AuditLogs(Vec<AuditEvent>),
@@ -96,23 +124,45 @@ pub enum BackendMessage {
 
 #[derive(Debug, Clone)]
 pub enum BackendRequest {
+    ExportSession { session_id: String, destination: String },
     FetchSessionDetail(String),  // session_id
 }
 
 // ── Backend Loop ────────────────────────────────────────────────────────────
 
+fn database_config() -> Result<tokio_postgres::Config, String> {
+    let password = std::env::var("POSTGRES_PASSWORD")
+        .map_err(|_| "Set POSTGRES_PASSWORD for the research database".to_string())?;
+    let port = std::env::var("POSTGRES_PORT").unwrap_or_else(|_| "5433".into())
+        .parse::<u16>().map_err(|_| "POSTGRES_PORT must be a valid port".to_string())?;
+    let mut config = tokio_postgres::Config::new();
+    config.host(&std::env::var("POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".into()));
+    config.port(port);
+    config.user(&std::env::var("POSTGRES_USER").unwrap_or_else(|_| "chronos".into()));
+    config.dbname(&std::env::var("POSTGRES_DB").unwrap_or_else(|_| "chronos".into()));
+    config.password(password);
+    config.connect_timeout(Duration::from_secs(5));
+    Ok(config)
+}
+
 pub async fn start_backend(
     tx: flume::Sender<BackendMessage>,
     rx_req: flume::Receiver<BackendRequest>,
 ) {
+    let pg_config = match database_config() {
+        Ok(config) => config,
+        Err(message) => {
+            log::error!("Research database configuration: {}", message);
+            let _ = tx.send(BackendMessage::PostgresConnected(false));
+            return;
+        }
+    };
     // ── Postgres: audit log stream ──────────────────────────────────────
     let tx_pg = tx.clone();
+    let audit_config = pg_config.clone();
     tokio::spawn(async move {
         loop {
-            match tokio_postgres::connect(
-                "host=127.0.0.1 port=5433 user=chronos password=chronos_dev_password dbname=chronos",
-                NoTls,
-            ).await {
+            match audit_config.connect(NoTls).await {
                 Ok((client, connection)) => {
                     let _ = tx_pg.send(BackendMessage::PostgresConnected(true));
 
@@ -127,7 +177,7 @@ pub async fn start_backend(
                         // Fetch new audit events
                         match client.query(
                             "SELECT id, session_id::text, timestamp, operation, path, inode \
-                             FROM audit_log WHERE id > $1 ORDER BY id DESC LIMIT 50",
+                             FROM audit_log WHERE id > $1 ORDER BY id ASC LIMIT 1000",
                             &[&last_id],
                         ).await {
                             Ok(rows) => {
@@ -168,12 +218,10 @@ pub async fn start_backend(
 
     // ── Postgres: session list + active count (5s poll) ─────────────────
     let tx_sessions = tx.clone();
+    let sessions_config = pg_config.clone();
     tokio::spawn(async move {
         loop {
-            match tokio_postgres::connect(
-                "host=127.0.0.1 port=5433 user=chronos password=chronos_dev_password dbname=chronos",
-                NoTls,
-            ).await {
+            match sessions_config.connect(NoTls).await {
                 Ok((client, connection)) => {
                     tokio::spawn(async move {
                         if let Err(e) = connection.await {
@@ -249,11 +297,26 @@ pub async fn start_backend(
             };
 
             match req {
+                BackendRequest::ExportSession { session_id, destination } => {
+                    // Operator-side helper only; never executed by a honeypot worker.
+                    // Argument arrays avoid shell interpretation of paths or identifiers.
+                    let python = std::env::var("APATE_PYTHON").unwrap_or_else(|_| "python3".into());
+                    let mut child = tokio::process::Command::new(python);
+                    child.args(["-m", "chronos.watcher.export_report", "--session-id",
+                                &session_id, "--output", &destination]);
+                    child.kill_on_drop(true);
+                    child.stdout(std::process::Stdio::null());
+                    child.stderr(std::process::Stdio::null());
+                    let result = match tokio::time::timeout(Duration::from_secs(90), child.status()).await {
+                        Ok(Ok(status)) if status.success() => Ok(destination),
+                        Ok(Ok(_)) => Err("Export failed. Check database settings, Python module availability, and choose a new output directory. Partial bundles lack complete.json.".into()),
+                        Ok(Err(_)) => Err("Could not launch APATE_PYTHON. Configure a Python environment with Apate installed.".into()),
+                        Err(_) => Err("Export exceeded 90 seconds; incomplete output must not be used as evidence.".into()),
+                    };
+                    let _ = tx_detail.send(BackendMessage::ExportResult(result));
+                }
                 BackendRequest::FetchSessionDetail(session_id) => {
-                    match tokio_postgres::connect(
-                        "host=127.0.0.1 port=5433 user=chronos password=chronos_dev_password dbname=chronos",
-                        NoTls,
-                    ).await {
+                    match pg_config.connect(NoTls).await {
                         Ok((client, connection)) => {
                             tokio::spawn(async move {
                                 if let Err(e) = connection.await {
@@ -322,7 +385,8 @@ pub async fn start_backend(
     let tx_rd = tx.clone();
     tokio::spawn(async move {
         loop {
-            match redis::Client::open("redis://127.0.0.1:6379/") {
+            match redis::Client::open(std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into())) {
                 Ok(client) => {
                     if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                         let _ = tx_rd.send(BackendMessage::RedisConnected(true));
@@ -366,7 +430,7 @@ pub async fn start_backend(
 async fn collect_provenance_snapshot(
     con: &mut redis::aio::MultiplexedConnection,
 ) -> redis::RedisResult<ProvenanceSummary> {
-    let keys: Vec<String> = con.keys("fs:blob_meta:*").await?;
+    let keys: Vec<String> = con.keys("session:*:fs:blob_meta:*").await?;
 
     let mut by_file_class: BTreeMap<String, i32> = BTreeMap::new();
     let mut entries: Vec<(f64, ProvenanceEntry)> = Vec::new();

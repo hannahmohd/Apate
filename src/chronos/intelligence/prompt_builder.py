@@ -86,14 +86,23 @@ class PromptBuilder:
 
         relevant_state = self._extract_relevant_state(machine_state, policy.file_class)
         category_instruction = _CATEGORY_INSTRUCTIONS.get(policy.category, "")
-        max_lines_instruction = f"Maximum {policy.max_lines} lines." if policy.max_lines else ""
+        max_lines_instruction = f"- Maximum {policy.max_lines} lines.\n" if policy.max_lines and policy.file_class not in ('log_file', 'history_file') else ""
+        detail = ''
+        if policy.file_class in ('log_file', 'history_file'):
+            detail = '- Produce a short excerpt of 3 to 8 entries, not a full archive. Stop generating after the excerpt.\n'
+        if path == '/etc/nginx/nginx.conf':
+            detail = ('- Serve static files from /var/www/html with index index.html.\n'
+                      '- Listen on port 80 and 443 ssl.\n'
+                      '- Use ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem and ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key.\n'
+                      '- CRITICAL: DO NOT use proxy_pass, upstream, fastcgi_pass, or include. Only static file serving.\n')
 
         prompt = (
             f"Generate the file '{safe_filename}' located at '{safe_path}'.\n\n"
             f"=== CONSTRAINTS ===\n"
             f"- Ubuntu {machine_state.get('ubuntu_version', '24.04')} "
             f"(kernel {machine_state.get('kernel_version', 'unknown')})\n"
-            f"- {max_lines_instruction}\n"
+            f"{max_lines_instruction}"
+            f"{detail}"
             f"- Artifact category: {policy.category} — {category_instruction}\n"
             f"- Do NOT invent any facts that are not present in the Machine State block below.\n"
             f"- Output ONLY the raw file content. No markdown fences. No preamble. No explanation.\n\n"

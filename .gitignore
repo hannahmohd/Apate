@@ -7,7 +7,7 @@
 # =======================================================================
 
 # Logs directory
-logs/
+/logs/
 *.log
 
 # Detached report workspace
@@ -38,6 +38,7 @@ MANIFEST
 
 # Virtual environments
 .env
+.local-deploy/
 .venv
 env/
 venv/
@@ -55,7 +56,6 @@ Cargo.lock
 *.out
 
 # Docker and containerization
-.dockerignore
 docker-compose.override.yml
 docker-compose.production.yml
 docker-compose.local.yml
@@ -194,8 +194,8 @@ snapshots/
 *.log
 *.log.*
 *.out
-log/
-logs/
+/log/
+/logs/
 syslog
 audit.log
 access.log
@@ -277,6 +277,7 @@ classified/
 security_scan_*
 vulnerability_*
 audit_*
+!src/chronos/core/audit_spool.py
 *.audit
 pen_test_*
 

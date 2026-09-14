@@ -70,7 +70,7 @@ ps:
 	docker compose ps
 
 prod:
-	docker compose -f docker-compose.prod.yml up --build -d
+	docker compose up --build -d
 
 logs:
 	docker compose logs -f core-engine
@@ -92,7 +92,6 @@ shell:
 
 clean:
 	docker compose down -v
-	docker system prune -f
 
 # ── Container-Internal Tests ─────────────────────────────────────────────────
 test:
@@ -166,4 +165,3 @@ demo-standalone:
 
 demo-integration:
 	PYTHONPATH=src python3 tests/integration/demo_integration.py
-

@@ -1,203 +1,62 @@
-# Mirage (Chronos Framework)
+# Apate / Mirage / Chronos
 
-> Repository codename: **Apate**
-> 
-> Product / idea name: **Mirage**
-> 
-> Core framework name: **Chronos**
+Apate is a research SSH honeypot with a focused Ubuntu command emulator, a FUSE filesystem backed by Redis, and local AI artifact generation. Mirage is the product name; Chronos is the implementation package.
 
-> **Cognitive Deception Infrastructure** 
-> *A deterministic Ubuntu honeypot with controlled AI artifact generation*
+This remains a research MVP. Removing subprocess execution closes one escape route; it does not establish a hardened container or a complete Ubuntu emulator.
 
-## Current Status
+## Actual execution path
 
-This repo is a working, validated MVP for a deterministic Ubuntu deception environment. The core platform is implemented and the project passes the current automated validation suite: **24 passed, 1 skipped**.
+An SSH connection gets a persistent worker process. The gateway registers its PID and session UUID in Redis. Emulated commands issue filesystem calls against the FUSE mount. FUSE resolves the caller PID and selects that session's Redis filesystem namespace, initialized from `config/ubuntu.yaml`.
 
-The project is not a generic AI application; it is a honeypot system that uses AI only in a constrained, content-generation role. The deterministic state layer, Redis-backed file system behavior, event collection, dashboard, and validation pipeline are in place and working.
+A session cannot read or mutate another session's filesystem. FUSE data and attribute caching are disabled to preserve that boundary. Session filesystem namespaces are ephemeral and normally removed after disconnect; audit evidence is stored separately in PostgreSQL.
 
-## Project Lifecycle
+Known AI-backed files generate on their first read. The generator claims a Redis lease, applies policy, validates output, and atomically commits only if the inode has not changed and it still owns the lease. Writes and deletion supersede generation. Listings do not generate content; attacker-created files remain empty until written, even if they reuse a manifest filename.
 
-- **Phase 1 (6 months):** Core deception platform engineering and validation — **Completed**.
-- **Phase 2 (6 months):** AI integration hardening — **Functionally implemented and working as an MVP**.
-- **Production hardening:** Remaining items are operational polish, not core missing functionality.
+The model receives trusted profile facts, not arbitrary session history or environment variables. Its output is file bytes only.
 
----
+## Run locally
 
-## What Chronos Is
+Requires Linux FUSE support through Docker and Docker Compose:
 
-Chronos emulates **one thing exceptionally well: an Ubuntu server.**
-
-It is a deterministic deception framework. AI is used only to fill file content in carefully constrained places. Everything else — filesystem state, inode allocation, directory structure, session tracking — is handled deterministically by Redis and Lua scripts, with no AI involvement.
-
-**Governing principle:**
-> Chronos is not an AI-powered operating system. It is a deterministic Ubuntu honeypot that uses AI only to generate plausible artifacts under strict constraints. The system improves through evidence-based policy updates, not autonomous AI learning.
-
----
-
-## The Problem This Solves
-
-**Traditional honeypots** — file operations aren't atomic, attackers detect inconsistencies:
-```
-Attacker: touch /tmp/pwn && ls /tmp
-Honeypot: (file not in listing) → DETECTED AS FAKE
-```
-
-**LLM-based honeypots** — hallucinate state when context windows expire:
-```
-Command: cd /home/ubuntu  → LLM remembers
-[50 commands later]
-Command: pwd        → LLM forgets → HALLUCINATION → DETECTED
-```
-
-**Chronos** — atomic state backed by Redis, AI only fills content:
-```
-Command: touch /etc/ghost.conf   → Stored in Redis (deterministic)
-Command: cat /etc/ghost.conf    → Redis miss → Ollama generates Ubuntu artifact
-Command: cat /etc/ghost.conf again → Reads from Redis cache (consistent)
-```
-
----
-
-## Key Features
-
-*  **Ubuntu-Only Emulation**: Emulates a single Ubuntu server with configurable packages, services, users, and kernel. Role is implied by installed software.
-*  **State Consistency**: Redis State Hypervisor keeps filesystem operations atomic and persistent. State truth never comes from AI.
-*  **FUSE Interface**: Intercepts system calls at the kernel boundary. Supports standard tools (`ls`, `cat`, `rm`, `find`, `grep`) without modification.
-*  **Controlled AI Generation**: Artifact Policy Engine assigns every file a category (`valid`, `empty`, `abandoned`, `corrupted`, …) *before* generation. AI fills a defined role, never invents facts.
-*  **Constraint-First Prompting**: Prompt Builder injects only relevant MachineState subgraph. AI receives hard limits (max lines, package versions, running services) and cannot contradict them.
-*  **Semantic Validation**: Four-tier validator rejects refusal boilerplate, non-Ubuntu content, MachineState contradictions, and density violations before any content is persisted.
-*  **Non-Blocking Generation**: GenerationOrchestrator runs inference in a background thread pool. FUSE `read()` never blocks indefinitely — adaptive timeouts return realistic POSIX errors (`EAGAIN`, `ETIMEDOUT`).
-*  **Session-Identity Architecture**: Every FUSE syscall carries a session ID injected by the SSH gateway. No `/proc` lookups. Quotas, evidence, and MachineState are all session-keyed.
-*  **Real-Time Analysis**: Command analyzer detects attack techniques using MITRE ATT&CK framework patterns.
-*  **Forensic Logging**: Complete audit trail in PostgreSQL for incident response and threat hunting.
-*  **Evidence Collection**: Per-command technique and risk enrichment, skill assessment on session close.
-*  **Overseer Dashboard**: 6-tab egui analysis interface — Live Ops, Sessions, Session Detail, with Threat Analytics, AI Provenance, and Configuration views planned.
-*  **Layer 0 Routing**: High-performance Rust traffic analysis for initial threat tagging.
-
-> **⚠ Known Gap:** SSH commands currently use a stub shell and do not route through FUSE. This is the Tier 1 priority (M2.H). See [Roadmap](docs/ROADMAP.md).
-
----
-
-## Architecture
-
-```
-SSH Gateway
-  │ (session_id injected via threading.local)
-  ▼
-FUSE Filesystem (ChronosFUSE)
-  │ read() / create() / readdir()
-  ▼
-State Hypervisor (Redis + Lua)  ← sole source of filesystem truth
-  │
-  ├─ cache hit → return blob directly
-  │
-  └─ cache miss → GenerationOrchestrator
-             │
-             ├─ ArtifactPolicyEngine  (assigns file category)
-             ├─ PromptBuilder      (constraint-first prompt)
-             ├─ InferenceRuntime    (Ollama local inference)
-             └─ SemanticValidator    (validate vs. MachineState)
-                  │
-                  └─ persist blob + provenance to Redis
-```
-
-**Machine definition** (`config/ubuntu.yaml`): what the machine *is* — packages, services, users, ports. 
-**Generation behavior** (`config/generation_policy.yaml`): how AI generates artifacts — probability distributions, max lines, model routing, quotas.
-
-These two files are deliberately kept separate (state vs. behavior).
-
----
-
-## Quick Start
-
-### Prerequisites
-*  Docker & Docker Compose
-*  No cloud API keys required — inference runs locally via Ollama
-
-### Run the Stack
-
-```bash
-git clone https://github.com/Rizzy1857/Apate.git chronos
-cd chronos
+```sh
 docker compose up --build -d
+ssh -p 2222 ubuntu@localhost
 ```
 
-### Verify Status
+Ports bind to localhost by default. PostgreSQL must be available at startup. Ollama must have the models named in `config/generation_policy.yaml` installed to exercise real inference; otherwise eligible files receive a bounded fallback. The repository does not automatically download models.
 
-```bash
-docker compose logs -f core-engine
+Examples:
+
+```sh
+cat /etc/passwd
+echo example > /tmp/note
+cat /tmp/note
+cat /etc/nginx/nginx.conf
 ```
 
-### Interact (Simulate Attack)
+The shell supports a limited subset of common commands and flags. SSH exec channels, arbitrary binaries, interpreters and network tools are rejected.
 
-```bash
-ssh -p 2222 ubuntu@localhost  # any password accepted
+## Verification
+
+Install `requirements.txt`, pytest, pytest-asyncio, Redis server, and the native FUSE library, then:
+
+```sh
+PYTHONPATH=src python3 -m pytest tests -q
+docker compose config --quiet
 ```
 
----
+Regression tests start disposable Redis instances over Unix sockets. Seven legacy tests are skipped by default because they mutate localhost services or stop named Docker containers; opting in with `--legacy-infrastructure` requires a disposable environment.
 
-## Testing
+`tests/integration/verify_linux_ssh.py` exercises real Linux SSH workers, FUSE, session isolation, truncation, and optionally PostgreSQL evidence inside a disposable container. See `docs/HARDENING_REVIEW.md` for findings, verification and remaining gaps.
 
-### Validation (no infrastructure needed)
+## Scope and limits
 
-```bash
-# Core infrastructure integrity
-make validate-core
+HTTP gateway code has been removed. Rust Layer 0 still exists under `src/chronos/layer0` but is not integrated into deployment. The native dashboard and world simulation remain experimental.
 
-# Real attack simulation (28 commands × 5 scenarios)
-make validate-attacks
-```
+Current limits include 32 accepted connections, 8 KiB command input, 1,000 commands per session, 1 MiB files, a conservative 16 MiB write allocation budget per session, bounded generation admission, and per-session/global inference quotas. These are safeguards, not load-test certification.
 
-### Verification (unit-level component tests)
-
-```bash
-make verify
-
-# Or individually
-PYTHONPATH=src python3 tests/verification/verify_phase1.py # State & FUSE
-PYTHONPATH=src python3 tests/verification/verify_phase2.py # Persistence & Lua
-PYTHONPATH=src python3 tests/verification/verify_phase3.py # Intelligence layer
-PYTHONPATH=src python3 tests/verification/verify_phase4.py # Gateway, Watcher, Skills
-```
-
----
-
-## Component Overview
-
-| Component | Purpose | Status |
-|-----------|---------|--------|
-| State Hypervisor | Redis atomic filesystem state | Complete |
-| FUSE Interface | Kernel VFS interception + non-blocking AI integration | Phase 2 |
-| UbuntuProfile | Single Ubuntu machine definition from `ubuntu.yaml` | Complete |
-| ArtifactPolicyEngine | File-class policy resolution (category + constraints) | Complete |
-| PromptBuilder | Constraint-first prompt construction | Complete |
-| SemanticValidator | 4-tier validation against MachineState | Complete |
-| GenerationOrchestrator | Non-blocking background generation pool | Complete |
-| InferenceRuntime | Local Ollama HTTP client | Complete |
-| SSH Gateway | Session-aware interactive shell (⚠ stub — M2.H pending) | Phase 2 |
-| HTTP Gateway | Web application emulation | Complete |
-| Visual Dashboard | Rust-based egui 6-tab Overseer interface | Complete |
-| Evidence Collector | Per-command enrichment + skill assessment persistence | Complete |
-| Command Analyzer | MITRE ATT&CK technique detection | Complete |
-| Threat Library | Known attack signature database | Complete |
-| Skill Detector | Attacker behavioral profiling (monitoring only) | Complete |
-| Event Processor | Pattern correlation | Complete |
-| Audit Streamer | Real-time event streaming | Complete |
-| Layer 0 (Rust) | Traffic analysis | Complete |
-| Entropy Engine | Filesystem entropy simulation | Planned (Tier 2) |
-| Aging System | Realistic timestamp distribution | Planned (Tier 2) |
-| Circuit Breaker | Graceful Ollama degradation | Planned (Tier 1) |
-
----
-
-## Documentation
-
-*  [System Architecture](docs/ARCHITECTURE.md)
-*  [AI Architecture](docs/AI_ARCHITECTURE.md)
-*  [AI Roadmap](docs/AI_ROADMAP.md)
-*  [Mirage Roadmap](docs/ROADMAP.md) - Phase plan, milestones, and delivery criteria
-*  [Developer Onboarding](docs/ONBOARDING.md)
+Outstanding work includes fuller shell/permission semantics, durable audit delivery across crashes, orphan namespace recovery after process death, reproducible image/model pinning, and a stronger runtime isolation boundary. Default credentials and mutable image tags are for local research only.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+[MIT](LICENSE).

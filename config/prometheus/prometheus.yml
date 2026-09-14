@@ -7,14 +7,6 @@ scrape_configs:
       - targets: ['core-engine:8000'] 
     metrics_path: '/metrics'
 
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis-store:6379']
-
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['db-store:5432']
-
   - job_name: 'chronos_dashboard_exporter'
     static_configs:
       - targets: ['dashboard-exporter:9100']

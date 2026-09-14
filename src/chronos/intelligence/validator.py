@@ -68,6 +68,25 @@ class SemanticValidator:
     ) -> ValidationResult:
         """Run all applicable validation checks and return a ValidationResult."""
 
+        if not isinstance(content, str):
+            return ValidationResult(accepted=False, reason="invalid_content_type")
+        if len(content.encode('utf-8')) > 65536 or '\x00' in content:
+            return ValidationResult(accepted=False, reason="invalid_content_size_or_nul")
+        if machine_state.get('artifact_path') == '/etc/nginx/nginx.conf':
+            # The profile describes a static web root, not an invented backend.
+            if re.search(r'\b(proxy_pass|upstream)\b', content):
+                return ValidationResult(False, 'nginx: backend is not defined in the profile')
+            manifest = json.loads(machine_state.get('filesystem_manifest', '{}'))
+            paths = {entry['path'] for entry in manifest.get('entries', [])}
+            for referenced in re.findall(r'\b(?:include|ssl_certificate|ssl_certificate_key)\s+([^;\s]+)', content):
+                if referenced not in paths:
+                    return ValidationResult(False, 'nginx: referenced file absent from manifest')
+            if not re.search(r'\broot\s+/var/www/html\s*;', content):
+                return ValidationResult(False, 'nginx: static web root missing')
+        if machine_state.get('artifact_path') == '/var/www/html/index.html':
+            if '<html' not in content.lower() or '</html>' not in content.lower():
+                return ValidationResult(False, 'html: incomplete document')
+
         # Tier 1: Refusal boilerplate (always)
         result = self._check_refusal(content)
         if not result.accepted:
@@ -85,10 +104,9 @@ class SemanticValidator:
                 return result
 
         # Tier 4: Information density (high only)
-        if policy.validation_strictness == "high":
-            result = self._check_density(content, policy)
-            if not result.accepted:
-                return result
+        result = self._check_density(content, policy)
+        if not result.accepted:
+            return result
 
         return ValidationResult(accepted=True)
 
@@ -185,6 +203,8 @@ class SemanticValidator:
 
     def _check_density(self, content: str, policy: "ArtifactPolicy") -> ValidationResult:
         """Reject content that exceeds the max_lines constraint."""
+        if policy.max_entries and len(content.splitlines()) > policy.max_entries:
+            return ValidationResult(accepted=False, reason='max_entries_exceeded')
         if policy.max_lines:
             line_count = len(content.splitlines())
             if line_count > policy.max_lines:

@@ -98,6 +98,7 @@ def test_inference_runtime_integration(mock_post):
     mock_post.side_effect = None
     mock_response = MagicMock()
     mock_response.json.return_value = {"response": "Success!"}
+    mock_response.iter_content.return_value = [b'{"response": "Success!", "done": true}\n']
     mock_post.return_value = mock_response
     
     res = runtime.generate("test prompt", model="llama3")
